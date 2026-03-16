@@ -1,10 +1,10 @@
-# pages/2_ROI_설정.py — ROI(관심구역) 설정 화면
+# pages/2_ROI_설정.py — ROI(관심구역) 직접 그리기 화면
 #
 # 사용 흐름:
-#   1. 영상 소스 선택 → 첫 프레임 미리보기
-#   2. 다각형 꼭짓점 좌표를 텍스트로 입력 (또는 예시 ROI 선택)
-#   3. 미리보기에서 ROI 확인
-#   4. 저장 버튼 클릭 → roi_configs/<소스명>.json 저장
+#   1. 영상 소스 선택 → 첫 프레임 불러오기
+#   2. 영상 위에 마우스로 점을 클릭 → 자동으로 다각형 완성
+#   3. 저장 버튼 클릭 → roi_configs/<이름>.json 저장
+#   4. 모니터링 페이지에서 같은 이름으로 자동 로드
 
 import streamlit as st
 import cv2
@@ -19,10 +19,14 @@ if ROOT not in sys.path:
 
 from config import DATA_DIR
 from core.video_source import VideoSource
-from core.roi_manager  import (
-    save_roi, load_roi, parse_roi_text,
-    draw_roi_on_frame, list_saved_rois
-)
+from core.roi_manager  import save_roi, load_roi, draw_roi_on_frame, list_saved_rois
+
+# streamlit-drawable-canvas 임포트 (없으면 안내 메시지)
+try:
+    from streamlit_drawable_canvas import st_canvas
+    CANVAS_AVAILABLE = True
+except ImportError:
+    CANVAS_AVAILABLE = False
 
 # ── 페이지 설정 ────────────────────────────────────────
 st.set_page_config(
@@ -32,14 +36,29 @@ st.set_page_config(
 )
 
 st.title("🗺️ ROI(관심구역) 설정")
+
+# 라이브러리 미설치 시 안내
+if not CANVAS_AVAILABLE:
+    st.error(
+        "❌ `streamlit-drawable-canvas` 라이브러리가 없습니다.\n\n"
+        "터미널에서 아래 명령어를 실행하고 앱을 재시작하세요:\n\n"
+        "```\npip install streamlit-drawable-canvas\n```"
+    )
+    st.stop()
+
 st.markdown("""
-ROI(Region of Interest)는 보행자 위험을 감지할 **위험 구역**입니다.
-사람의 발 위치가 이 구역 안에 들어오면 위험 상태로 판단합니다.
+**사용 방법:** 영상 프레임 위에서 마우스로 **점을 클릭**하면 자동으로 위험 구역(다각형)이 만들어집니다.
+완성 후 **💾 ROI 저장** 버튼을 누르세요.
 """)
 st.markdown("---")
 
-# ── 헬퍼 ──────────────────────────────────────────────
-def get_video_files() -> list[str]:
+
+# ══════════════════════════════════════════════════════
+# 헬퍼
+# ══════════════════════════════════════════════════════
+CANVAS_MAX_WIDTH = 800   # 캔버스 최대 표시 너비(픽셀)
+
+def get_video_files() -> list:
     if not os.path.exists(DATA_DIR):
         return []
     return [
@@ -47,59 +66,44 @@ def get_video_files() -> list[str]:
         if f.lower().endswith((".mp4", ".avi", ".mov", ".mkv"))
     ]
 
-def get_frame_from_source(source_path: str):
-    """소스에서 첫 프레임을 가져옵니다."""
-    vs = VideoSource(source_path)
-    frame = vs.get_first_frame()
-    return frame
-
-# ── 예시 ROI 정의 (화면 크기별 상대 좌표로 자동 계산) ─
-def make_preset_roi(w: int, h: int, preset: str) -> list:
+def extract_polygon_from_canvas(json_data: dict, scale: float) -> np.ndarray | None:
     """
-    영상 해상도에 맞춰 예시 ROI 좌표를 생성합니다.
+    st_canvas 결과 JSON에서 다각형 좌표를 추출합니다.
+    캔버스 표시 크기에서 원본 프레임 크기로 역스케일합니다.
     """
-    presets = {
-        "화면 중앙 사각형 (기본)": [
-            [int(w * 0.25), int(h * 0.30)],
-            [int(w * 0.75), int(h * 0.30)],
-            [int(w * 0.75), int(h * 0.90)],
-            [int(w * 0.25), int(h * 0.90)],
-        ],
-        "하단 횡단보도 영역": [
-            [int(w * 0.10), int(h * 0.55)],
-            [int(w * 0.90), int(h * 0.55)],
-            [int(w * 0.90), int(h * 0.95)],
-            [int(w * 0.10), int(h * 0.95)],
-        ],
-        "좌측 골목 입구 삼각형": [
-            [int(w * 0.05), int(h * 0.20)],
-            [int(w * 0.40), int(h * 0.20)],
-            [int(w * 0.20), int(h * 0.90)],
-        ],
-        "우측 골목 입구 삼각형": [
-            [int(w * 0.60), int(h * 0.20)],
-            [int(w * 0.95), int(h * 0.20)],
-            [int(w * 0.80), int(h * 0.90)],
-        ],
-        "전체 하단 절반": [
-            [0,            int(h * 0.50)],
-            [w - 1,        int(h * 0.50)],
-            [w - 1,        h - 1],
-            [0,            h - 1],
-        ],
-    }
-    return presets.get(preset, presets["화면 중앙 사각형 (기본)"])
+    if not json_data:
+        return None
+    objects = json_data.get("objects", [])
+    if not objects:
+        return None
 
-# ── 레이아웃 ───────────────────────────────────────────
-left_col, right_col = st.columns([1, 2])
+    # 가장 마지막으로 그린 다각형 사용
+    for obj in reversed(objects):
+        if obj.get("type") != "path":
+            continue
+        path = obj.get("path", [])
+        points = []
+        for cmd in path:
+            # SVG path 명령어: M(시작점), L(직선), z(닫기)
+            if cmd[0] in ("M", "L") and len(cmd) >= 3:
+                x = int(round(cmd[1] / scale))
+                y = int(round(cmd[2] / scale))
+                points.append([x, y])
+        if len(points) >= 3:
+            return np.array(points, dtype=np.int32)
 
-with left_col:
-    st.subheader("① 영상 소스 선택")
+    return None
+
+
+# ══════════════════════════════════════════════════════
+# 레이아웃: 사이드바(설정) + 메인(캔버스)
+# ══════════════════════════════════════════════════════
+with st.sidebar:
+    st.header("⚙️ 소스 설정")
 
     source_type = st.radio(
-        "소스 유형",
+        "영상 소스",
         ["📁 로컬 영상 파일", "📡 RTSP 스트림"],
-        key="roi_source_type",
     )
 
     selected_source = None
@@ -108,191 +112,183 @@ with left_col:
     if source_type == "📁 로컬 영상 파일":
         video_files = get_video_files()
         if video_files:
-            chosen = st.selectbox("파일 선택", video_files)
+            chosen       = st.selectbox("파일 선택", video_files)
             selected_source = os.path.join(DATA_DIR, chosen)
             source_label    = os.path.splitext(chosen)[0]
         else:
-            st.warning("`data/` 폴더에 영상 파일이 없습니다.")
+            st.warning("`data/` 폴더에 영상 파일을 넣어주세요.")
     else:
-        rtsp_input = st.text_input(
+        rtsp_url = st.text_input(
             "RTSP 주소",
-            value="rtsp://[ID]:[PW]@[IP]:554/Streaming/Channels/402",
+            placeholder="rtsp://admin:1234@192.168.0.100:554/Streaming/Channels/402",
         )
-        if rtsp_input.startswith("rtsp://"):
-            selected_source = rtsp_input
-            source_label    = "rtsp_stream"
+        if rtsp_url.startswith("rtsp://"):
+            selected_source = rtsp_url
 
-    # 커스텀 소스 이름 (저장 키로 사용)
     source_label = st.text_input(
-        "ROI 저장 이름 (영문/숫자)",
+        "ROI 저장 이름",
         value=source_label,
-        help="이 이름으로 ROI가 저장됩니다. 모니터링 페이지에서 같은 이름을 선택해야 ROI가 로드됩니다.",
+        help="모니터링 페이지에서 이 이름과 같은 소스를 선택해야 ROI가 자동 로드됩니다.",
     )
 
-    # 첫 프레임 가져오기 버튼
-    load_btn = st.button("📷 기준 프레임 불러오기", type="primary",
-                         disabled=selected_source is None)
+    st.markdown("---")
 
+    # 기준 프레임 불러오기
+    load_btn = st.button(
+        "📷 기준 프레임 불러오기",
+        type="primary",
+        disabled=selected_source is None,
+        use_container_width=True,
+    )
     if load_btn:
         with st.spinner("프레임 로딩 중..."):
-            frame = get_frame_from_source(selected_source)
+            vs    = VideoSource(selected_source)
+            frame = vs.get_first_frame()
         if frame is not None:
-            st.session_state["roi_frame"] = frame
-            st.session_state["roi_h"], st.session_state["roi_w"] = frame.shape[:2]
-            st.success(f"프레임 로드 완료 ({st.session_state['roi_w']}×{st.session_state['roi_h']})")
+            st.session_state["roi_frame"]       = frame
+            st.session_state["roi_source_label"] = source_label
+            st.session_state["roi_canvas_key"]  = st.session_state.get("roi_canvas_key", 0) + 1
+            h, w = frame.shape[:2]
+            st.success(f"✅ 프레임 로드 완료 ({w}×{h})")
         else:
             st.error("❌ 프레임을 가져올 수 없습니다. 소스를 확인하세요.")
 
     st.markdown("---")
-    st.subheader("② ROI 좌표 입력")
 
-    # 예시 ROI 사용 옵션
-    use_preset = st.checkbox("예시 ROI 사용", value=True)
-
-    if use_preset:
-        preset_name = st.selectbox(
-            "예시 ROI 선택",
-            [
-                "화면 중앙 사각형 (기본)",
-                "하단 횡단보도 영역",
-                "좌측 골목 입구 삼각형",
-                "우측 골목 입구 삼각형",
-                "전체 하단 절반",
-            ],
-        )
-        if "roi_w" in st.session_state:
-            preset_pts = make_preset_roi(
-                st.session_state["roi_w"],
-                st.session_state["roi_h"],
-                preset_name,
-            )
-            # 텍스트 박스에 자동으로 좌표 채우기
-            auto_text = "\n".join(f"{p[0]},{p[1]}" for p in preset_pts)
-        else:
-            auto_text = "먼저 기준 프레임을 불러오세요."
-    else:
-        auto_text = st.session_state.get("roi_coord_text", "")
-
-    roi_text = st.text_area(
-        "꼭짓점 좌표 (한 줄에 x,y 형식으로 입력, 최소 3점)",
-        value=auto_text,
-        height=160,
-        help="예시:\n100,200\n500,200\n500,450\n100,450",
-        key="roi_coord_text_area",
-    )
-
-    # 기존 저장된 ROI 불러오기
-    st.markdown("---")
-    st.subheader("③ 기존 ROI 불러오기")
+    # 저장된 ROI 목록 & 불러오기
+    st.subheader("📂 저장된 ROI")
     saved_list = list_saved_rois()
     if saved_list:
-        load_existing = st.selectbox("저장된 ROI 목록", ["선택 안 함"] + saved_list)
-        if load_existing != "선택 안 함":
-            existing_pts = load_roi(load_existing)
-            if existing_pts is not None:
-                loaded_text = "\n".join(f"{p[0]},{p[1]}" for p in existing_pts)
-                st.code(loaded_text, language=None)
-                st.info(f"'{load_existing}' ROI: {len(existing_pts)}개 꼭짓점")
+        sel = st.selectbox("불러올 ROI 선택", ["— 선택 —"] + saved_list)
+        if sel != "— 선택 —":
+            pts = load_roi(sel)
+            if pts is not None:
+                st.success(f"'{sel}': {len(pts)}개 꼭짓점")
+                st.caption("\n".join(f"P{i+1}: ({p[0]}, {p[1]})" for i, p in enumerate(pts)))
     else:
         st.caption("저장된 ROI 없음")
 
-    # 저장 버튼
     st.markdown("---")
-    save_btn = st.button("💾 ROI 저장", type="primary",
-                         disabled=(not source_label or not roi_text.strip()))
 
-    if save_btn:
-        if not source_label:
-            st.error("ROI 저장 이름을 입력하세요.")
-        else:
-            pts = parse_roi_text(roi_text)
-            if pts is None:
-                st.error("좌표 형식 오류. 각 줄에 `x,y` 형식으로 입력하세요. 최소 3점 필요.")
-            else:
-                path = save_roi(source_label, pts.tolist())
-                st.success(f"✅ ROI 저장 완료: `{path}`")
-                st.session_state["roi_saved_pts"] = pts
-
-# ── 오른쪽: 프레임 미리보기 ────────────────────────────
-with right_col:
-    st.subheader("④ ROI 미리보기")
-
-    frame = st.session_state.get("roi_frame", None)
-
-    if frame is None:
-        st.info("왼쪽에서 **기준 프레임 불러오기**를 클릭하면 영상 첫 프레임이 여기에 표시됩니다.")
-    else:
-        # 현재 텍스트 영역의 좌표로 ROI 그리기
-        preview_frame = frame.copy()
-        current_pts   = parse_roi_text(roi_text)
-
-        # 저장된 ROI가 있으면 함께 표시
-        if current_pts is not None:
-            preview_frame = draw_roi_on_frame(preview_frame, current_pts, danger=False)
-
-            # 꼭짓점 번호와 좌표 표시
-            for i, pt in enumerate(current_pts):
-                label = f"P{i+1}({int(pt[0])},{int(pt[1])})"
-                cv2.putText(preview_frame, label,
-                            (int(pt[0]) + 6, int(pt[1]) - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                            (0, 255, 255), 1, cv2.LINE_AA)
-        else:
-            cv2.putText(preview_frame, "ROI 미설정",
-                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-                        (100, 100, 100), 2, cv2.LINE_AA)
-
-        # 프레임 크기 정보 오버레이
-        h, w = frame.shape[:2]
-        cv2.putText(preview_frame, f"{w}x{h}",
-                    (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (200, 200, 200), 1, cv2.LINE_AA)
-
-        # BGR → RGB 변환
-        rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
-        st.image(rgb, caption="ROI 미리보기 (노란선=ROI 경계)", use_container_width=True)
-
-        # 현재 좌표 정보
-        if current_pts is not None:
-            st.success(f"현재 ROI: {len(current_pts)}개 꼭짓점")
-            pts_df_data = {
-                "꼭짓점": [f"P{i+1}" for i in range(len(current_pts))],
-                "X": [int(p[0]) for p in current_pts],
-                "Y": [int(p[1]) for p in current_pts],
-            }
-            import pandas as pd
-            st.dataframe(pd.DataFrame(pts_df_data), use_container_width=True)
-        else:
-            if roi_text.strip():
-                st.error("좌표 형식이 잘못되었습니다. 각 줄에 `x,y` 형식으로 입력하세요.")
-
-    # ── 좌표 입력 가이드 ─────────────────────────────
-    with st.expander("📖 좌표 입력 방법 안내"):
+    # 도움말
+    with st.expander("❓ 사용 방법 안내"):
         st.markdown("""
-        ### 좌표 입력 규칙
-
-        - 각 줄에 꼭짓점 하나를 `X,Y` 형식으로 입력합니다.
-        - 최소 **3개** 꼭짓점이 필요합니다.
-        - 좌표는 영상의 픽셀 위치입니다.
-          - 좌상단이 (0, 0)
-          - 우하단이 (영상너비-1, 영상높이-1)
-
-        ### 예시 (640×480 영상 기준)
-
-        ```
-        160,144
-        480,144
-        480,432
-        160,432
-        ```
-
-        ### 좌표 확인 방법
-
-        1. **기준 프레임 불러오기**로 첫 프레임을 표시합니다.
-        2. **예시 ROI**를 선택해서 대략적인 위치를 잡습니다.
-        3. 수치를 직접 수정하여 정확한 구역을 지정합니다.
-        4. 미리보기로 확인 후 **ROI 저장** 버튼을 누릅니다.
-
-        > 💡 영상에 마우스를 올리면 픽셀 좌표가 표시되지 않아 불편할 수 있습니다.
-        > 예시 ROI를 기반으로 조금씩 조정하는 방법을 권장합니다.
+        1. 영상 소스를 선택하고 **기준 프레임 불러오기** 클릭
+        2. 오른쪽 영상 위에서 **마우스 클릭**으로 꼭짓점을 찍으세요
+        3. 마지막 점에서 **더블클릭**하면 다각형이 닫힙니다
+        4. 잘못 그렸으면 **🗑️ 다시 그리기** 버튼 클릭
+        5. 완성 후 **💾 ROI 저장** 클릭
+        ---
+        💡 **좌표 (0,0)** = 화면 왼쪽 상단
+        💡 꼭짓점은 **최소 3개** 이상이어야 합니다
         """)
+
+
+# ══════════════════════════════════════════════════════
+# 메인 영역: 캔버스
+# ══════════════════════════════════════════════════════
+frame = st.session_state.get("roi_frame", None)
+
+if frame is None:
+    st.info(
+        "👈 왼쪽 사이드바에서 영상 소스를 선택한 뒤\n\n"
+        "**📷 기준 프레임 불러오기** 버튼을 클릭하면\n\n"
+        "여기에 영상이 표시됩니다."
+    )
+    st.stop()
+
+# ── 프레임 크기 & 스케일 계산 ───────────────────────────
+orig_h, orig_w = frame.shape[:2]
+scale          = CANVAS_MAX_WIDTH / orig_w
+canvas_w       = CANVAS_MAX_WIDTH
+canvas_h       = int(orig_h * scale)
+
+# ── BGR → PIL 변환 (캔버스 배경 이미지) ─────────────────
+rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+pil_img = Image.fromarray(rgb).resize((canvas_w, canvas_h), Image.LANCZOS)
+
+# ── 상단 버튼 행 ─────────────────────────────────────────
+btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 2])
+
+# 다시 그리기: canvas key를 바꿔서 캔버스를 초기화
+if btn_col1.button("🗑️ 다시 그리기", use_container_width=True):
+    st.session_state["roi_canvas_key"] = st.session_state.get("roi_canvas_key", 0) + 1
+    st.rerun()
+
+# ROI 저장 버튼
+save_clicked = btn_col2.button("💾 ROI 저장", type="primary", use_container_width=True)
+
+btn_col3.caption(
+    f"원본 해상도: {orig_w}×{orig_h} | "
+    f"캔버스: {canvas_w}×{canvas_h} | "
+    f"저장 이름: **{st.session_state.get('roi_source_label', source_label) or '(미입력)'}**"
+)
+
+# ── 캔버스 표시 ──────────────────────────────────────────
+st.markdown("##### ✏️ 영상 위에 마우스로 점을 클릭해 ROI를 그리세요")
+st.caption("클릭 → 꼭짓점 추가 | 더블클릭 → 다각형 완성 | 🗑️ 버튼 → 초기화")
+
+canvas_result = st_canvas(
+    fill_color    = "rgba(0, 255, 200, 0.15)",   # ROI 내부 반투명 녹색
+    stroke_width  = 2,
+    stroke_color  = "#00FFC8",                    # ROI 테두리 색
+    background_image = pil_img,
+    drawing_mode  = "polygon",                    # 다각형 모드
+    point_display_radius = 6,                     # 꼭짓점 점 크기
+    key           = f"roi_canvas_{st.session_state.get('roi_canvas_key', 0)}",
+    height        = canvas_h,
+    width         = canvas_w,
+    update_streamlit = True,
+)
+
+# ── 좌표 추출 & 미리보기 ─────────────────────────────────
+roi_pts = extract_polygon_from_canvas(canvas_result.json_data, scale)
+
+if roi_pts is not None:
+    # 추출된 좌표 정보 표시
+    info_col1, info_col2 = st.columns([1, 2])
+    with info_col1:
+        st.success(f"✅ {len(roi_pts)}개 꼭짓점 인식됨")
+        pts_text = "\n".join(f"P{i+1}: ({p[0]}, {p[1]})" for i, p in enumerate(roi_pts))
+        st.code(pts_text, language=None)
+    with info_col2:
+        # 원본 프레임에 ROI 오버레이해서 확인용으로 표시
+        preview = frame.copy()
+        preview = draw_roi_on_frame(preview, roi_pts, danger=False)
+        for i, pt in enumerate(roi_pts):
+            cv2.putText(
+                preview, f"P{i+1}",
+                (int(pt[0]) + 5, int(pt[1]) - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (0, 255, 200), 2, cv2.LINE_AA,
+            )
+        preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+        st.image(
+            Image.fromarray(preview_rgb).resize((canvas_w, canvas_h), Image.LANCZOS),
+            caption="원본 해상도 기준 ROI 미리보기",
+            use_container_width=True,
+        )
+else:
+    if canvas_result.json_data and canvas_result.json_data.get("objects"):
+        st.warning("⚠️ 다각형을 완성하려면 마지막 점에서 **더블클릭**하세요.")
+    else:
+        st.info("👆 위 영상 위에서 마우스로 점을 클릭해 ROI를 그려보세요.")
+
+# ── 저장 처리 ────────────────────────────────────────────
+if save_clicked:
+    label_to_save = st.session_state.get("roi_source_label", source_label) or source_label
+    if not label_to_save:
+        st.error("❌ 사이드바에서 **ROI 저장 이름**을 입력하세요.")
+    elif roi_pts is None:
+        st.error("❌ 저장할 ROI가 없습니다. 영상 위에 다각형을 먼저 그려주세요.")
+    elif len(roi_pts) < 3:
+        st.error("❌ 꼭짓점이 3개 이상이어야 합니다.")
+    else:
+        path = save_roi(label_to_save, roi_pts.tolist())
+        st.success(
+            f"✅ ROI 저장 완료!\n\n"
+            f"- 이름: **{label_to_save}**\n"
+            f"- 꼭짓점: {len(roi_pts)}개\n"
+            f"- 저장 경로: `{path}`\n\n"
+            f"모니터링 페이지에서 **{label_to_save}** 소스를 선택하면 자동 로드됩니다."
+        )
